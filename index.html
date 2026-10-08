@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Remote</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden;
+    font-family: -apple-system, Helvetica, sans-serif; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+  body { display: flex; flex-direction: column; align-items: center; padding: 28px 24px 0; box-sizing: border-box; }
+  #device { color: #1fd662; font-size: 18px; font-weight: 500; background: none; border: 0; padding: 6px; margin-bottom: 14px; }
+  #art { width: 72vw; height: 72vw; max-width: 330px; max-height: 330px; border-radius: 8px; background: #1f1f1f center/cover no-repeat; }
+  #title { font-size: 26px; font-weight: 700; margin-top: 20px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 100%; }
+  #artist { font-size: 20px; color: #a6a6a6; margin-top: 6px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 100%; }
+  #bar { width: 100%; height: 4px; background: #404040; border-radius: 2px; margin-top: 22px; }
+  #fill { height: 4px; width: 0; background: #fff; border-radius: 2px; }
+  #times { width: 100%; display: flex; justify-content: space-between; font-size: 14px; color: #999; margin-top: 6px; }
+  #controls { display: flex; justify-content: space-between; align-items: center; width: 300px; margin-top: 14px; }
+  #controls button { background: none; border: 0; color: #fff; font-weight: 700; width: 100px; height: 84px; }
+  #prev, #next { font-size: 38px; } #play { font-size: 62px; }
+  #controls button:active { opacity: 0.4; }
+  #volume { width: 82%; margin-top: 16px; }
+  #status { font-size: 15px; color: #808080; margin-top: 12px; text-align: center; min-height: 20px; }
+  #sheet { position: fixed; left: 0; right: 0; bottom: 0; background: #1c1c1c; border-radius: 14px 14px 0 0; padding: 10px 0 24px; display: none; }
+  #sheet button { display: block; width: 100%; background: none; border: 0; color: #fff; font-size: 20px; padding: 16px; }
+  #sheet .cancel { color: #1fd662; font-weight: 600; }
+</style>
+</head>
+<body>
+<button id="device">Choose a device</button>
+<div id="art"></div>
+<div id="title">Loading…</div>
+<div id="artist"></div>
+<div id="bar"><div id="fill"></div></div>
+<div id="times"><span id="elapsed"></span><span id="duration"></span></div>
+<div id="controls">
+  <button id="prev">&#9664;&#9664;</button>
+  <button id="play">&#9654;</button>
+  <button id="next">&#9654;&#9654;</button>
+</div>
+<input id="volume" type="range" min="0" max="100" value="50">
+<div id="status"></div>
+<div id="sheet"></div>
+<script>
+// Spotify remote. The Spotify login arrives in the URL fragment (#cid=...&rt=...), which browsers never send to the web host.
+var API = 'https://api.spotify.com/v1/me/player';
+var params = {};
+location.hash.replace(/^#/, '').split('&').forEach(function (kv) { var p = kv.split('='); if (p[0]) params[p[0]] = decodeURIComponent(p[1] || ''); });
+var clientId = params.cid, refreshToken = params.rt;
+var accessToken = null, tokenExpiry = 0;
+var state = { playing: false, progress: 0, duration: 0, art: null, draggingVolume: false, lastPoll: 0 };
+var $ = function (id) { return document.getElementById(id); };
+
+function setStatus(msg) { $('status').textContent = msg || ''; }
+
+function getToken() {
+  if (accessToken && Date.now() < tokenExpiry - 60000) return Promise.resolve(accessToken);
+  if (!refreshToken) return Promise.reject(new Error('No Spotify login in this link'));
+  return fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(refreshToken) + '&client_id=' + encodeURIComponent(clientId)
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    if (!j.access_token) throw new Error('Spotify login expired');
+    accessToken = j.access_token;
+    tokenExpiry = Date.now() + j.expires_in * 1000;
+    if (j.refresh_token) refreshToken = j.refresh_token;
+    return accessToken;
+  });
+}
+
+function call(method, path, body) {
+  return getToken().then(function (token) {
+    var opts = { method: method, headers: { Authorization: 'Bearer ' + token } };
+    if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    return fetch(API + path, opts);
+  }).then(function (r) {
+    if (r.status === 401) accessToken = null;
+    if (r.status === 204 || r.status === 202) { setStatus(''); return { status: r.status, json: null }; }
+    return r.text().then(function (t) {
+      var j = null; try { j = t ? JSON.parse(t) : null; } catch (e) {}
+      setStatus(r.status >= 400 ? ((j && j.error && j.error.message) || 'Spotify error ' + r.status) : '');
+      return { status: r.status, json: j };
+    });
+  }).catch(function (e) { setStatus(e.message); return { status: 0, json: null }; });
+}
+
+function fmt(ms) { var s = Math.floor(ms / 1000), r = s % 60; return Math.floor(s / 60) + ':' + (r < 10 ? '0' : '') + r; }
+
+function render() {
+  $('fill').style.width = state.duration ? (100 * state.progress / state.duration) + '%' : '0';
+  $('elapsed').textContent = state.duration ? fmt(state.progress) : '';
+  $('duration').textContent = state.duration ? fmt(state.duration) : '';
+  $('play').innerHTML = state.playing ? '&#10074;&#10074;' : '&#9654;';
+}
+
+function poll() {
+  state.lastPoll = Date.now();
+  call('GET', '').then(function (res) {
+    var j = res.json;
+    if (res.status === 204 || (res.status === 200 && !j)) {
+      state.playing = false; state.duration = 0;
+      $('title').textContent = 'Nothing playing';
+      $('artist').textContent = 'Tap the device name above to start';
+      $('device').textContent = 'Choose a device';
+      $('art').style.backgroundImage = ''; state.art = null;
+      render(); return;
+    }
+    if (res.status !== 200) return;
+    var item = j.item || {};
+    state.playing = j.is_playing; state.progress = j.progress_ms || 0; state.duration = item.duration_ms || 0;
+    $('title').textContent = item.name || '';
+    $('artist').textContent = (item.artists || []).map(function (a) { return a.name; }).join(', ');
+    $('device').textContent = '▸ ' + (j.device ? j.device.name : '');
+    if (!state.draggingVolume && j.device && j.device.volume_percent != null) $('volume').value = j.device.volume_percent;
+    var images = (item.album && item.album.images) || [];
+    var url = images.length > 1 ? images[1].url : (images[0] && images[0].url);
+    if (url && url !== state.art) { state.art = url; $('art').style.backgroundImage = 'url(' + url + ')'; }
+    render();
+  });
+}
+
+function refreshSoon() { setTimeout(poll, 400); }
+
+$('play').onclick = function () {
+  state.playing = !state.playing; render();
+  call('PUT', state.playing ? '/play' : '/pause').then(refreshSoon);
+};
+$('next').onclick = function () { call('POST', '/next').then(refreshSoon); };
+$('prev').onclick = function () { call('POST', '/previous').then(refreshSoon); };
+$('volume').addEventListener('touchstart', function () { state.draggingVolume = true; });
+$('volume').onchange = function () {
+  state.draggingVolume = false;
+  call('PUT', '/volume?volume_percent=' + $('volume').value);
+};
+
+$('device').onclick = function () {
+  call('GET', '/devices').then(function (res) {
+    var sheet = $('sheet'); sheet.innerHTML = '';
+    var devices = (res.json && res.json.devices) || [];
+    devices.forEach(function (d) {
+      var b = document.createElement('button');
+      b.textContent = (d.is_active ? '✓ ' : '') + d.name;
+      b.onclick = function () { sheet.style.display = 'none'; call('PUT', '', { device_ids: [d.id], play: true }).then(refreshSoon); };
+      sheet.appendChild(b);
+    });
+    if (!devices.length) { var m = document.createElement('button'); m.textContent = 'No devices. Open Spotify somewhere first.'; sheet.appendChild(m); }
+    var c = document.createElement('button'); c.className = 'cancel'; c.textContent = 'Cancel';
+    c.onclick = function () { sheet.style.display = 'none'; };
+    sheet.appendChild(c); sheet.style.display = 'block';
+  });
+};
+
+document.addEventListener('touchmove', function (e) { if (e.target.id !== 'volume') e.preventDefault(); }, { passive: false });
+setInterval(function () {
+  if (state.playing) state.progress = Math.min(state.progress + 500, state.duration);
+  render();
+  if (Date.now() - state.lastPoll > 3000 && !document.hidden) poll();
+}, 500);
+document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
+poll();
+</script>
+</body>
+</html>
