@@ -17,6 +17,7 @@
   #actions { display: flex; justify-content: space-between; width: 100%; margin-top: 6px; }
   #actions button { background: none; border: 0; color: #fff; font-size: 30px; width: 64px; height: 48px; }
   #like.on { color: #1fd662; }
+  .pending #art, .pending #title, .pending #artist { opacity: 0.35; }
   #bar { width: 100%; height: 4px; background: #404040; border-radius: 2px; margin-top: 10px; }
   #fill { height: 4px; width: 0; background: #fff; border-radius: 2px; }
   #times { width: 100%; display: flex; justify-content: space-between; font-size: 14px; color: #999; margin-top: 6px; }
@@ -55,6 +56,7 @@ var params = {};
 location.hash.replace(/^#/, '').split('&').forEach(function (kv) { var p = kv.split('='); if (p[0]) params[p[0]] = decodeURIComponent(p[1] || ''); });
 var clientId = params.cid, refreshToken = params.rt;
 var accessToken = null, tokenExpiry = 0;
+var holdPlayUntil = 0, holdVolumeUntil = 0, skipFrom = null, skipUntil = 0;
 var state = { uri: null, liked: false, playlists: null, me: null, playing: false, progress: 0, duration: 0, art: null, draggingVolume: false, lastPoll: 0 };
 var $ = function (id) { return document.getElementById(id); };
 
@@ -117,11 +119,14 @@ function poll() {
     }
     if (res.status !== 200) return;
     var item = j.item || {};
-    state.playing = j.is_playing; state.progress = j.progress_ms || 0; state.duration = item.duration_ms || 0;
+    if (skipFrom && item.uri === skipFrom && Date.now() < skipUntil) return;
+    skipFrom = null; document.body.className = '';
+    if (Date.now() > holdPlayUntil) state.playing = j.is_playing;
+    state.progress = j.progress_ms || 0; state.duration = item.duration_ms || 0;
     $('title').textContent = item.name || '';
     $('artist').textContent = (item.artists || []).map(function (a) { return a.name; }).join(', ');
     $('device').textContent = '▸ ' + (j.device ? j.device.name : '');
-    if (!state.draggingVolume && j.device && j.device.volume_percent != null) $('volume').value = j.device.volume_percent;
+    if (!state.draggingVolume && Date.now() > holdVolumeUntil && j.device && j.device.volume_percent != null) $('volume').value = j.device.volume_percent;
     var images = (item.album && item.album.images) || [];
     var url = images.length > 1 ? images[1].url : (images[0] && images[0].url);
     if (url && url !== state.art) { state.art = url; $('art').style.backgroundImage = 'url(' + url + ')'; }
@@ -198,16 +203,21 @@ $('add').onclick = function () {
 };
 
 $('play').onclick = function () {
-  state.playing = !state.playing; render();
+  state.playing = !state.playing; holdPlayUntil = Date.now() + 1500; render();
   call('PUT', state.playing ? '/play' : '/pause').then(refreshSoon);
 };
-$('next').onclick = function () { call('POST', '/next').then(refreshSoon); };
-$('prev').onclick = function () { call('POST', '/previous').then(refreshSoon); };
+function skip(path) {
+  skipFrom = state.uri; skipUntil = Date.now() + 3000;
+  state.progress = 0; document.body.className = 'pending'; render();
+  call('POST', path).then(function () { setTimeout(poll, 300); setTimeout(poll, 900); setTimeout(function () { document.body.className = ''; }, 3000); });
+}
+$('next').onclick = function () { skip('/next'); };
+$('prev').onclick = function () { skip('/previous'); };
 $('volume').addEventListener('touchstart', function () { state.draggingVolume = true; });
-$('volume').onchange = function () {
-  state.draggingVolume = false;
-  call('PUT', '/volume?volume_percent=' + $('volume').value);
-};
+var lastVolumeSent = 0;
+function sendVolume() { lastVolumeSent = Date.now(); holdVolumeUntil = Date.now() + 2000; call('PUT', '/volume?volume_percent=' + $('volume').value); }
+$('volume').oninput = function () { if (Date.now() - lastVolumeSent > 250) sendVolume(); };
+$('volume').onchange = function () { state.draggingVolume = false; sendVolume(); };
 
 $('device').onclick = function () {
   call('GET', '/devices').then(function (res) {
