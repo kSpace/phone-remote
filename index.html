@@ -11,10 +11,13 @@
     font-family: -apple-system, Helvetica, sans-serif; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
   body { display: flex; flex-direction: column; align-items: center; padding: 28px 24px 0; box-sizing: border-box; }
   #device { color: #1fd662; font-size: 18px; font-weight: 500; background: none; border: 0; padding: 6px; margin-bottom: 14px; }
-  #art { width: 72vw; height: 72vw; max-width: 330px; max-height: 330px; border-radius: 8px; background: #1f1f1f center/cover no-repeat; }
+  #art { width: 66vw; height: 66vw; max-width: 330px; max-height: 330px; border-radius: 8px; background: #1f1f1f center/cover no-repeat; }
   #title { font-size: 26px; font-weight: 700; margin-top: 20px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 100%; }
   #artist { font-size: 20px; color: #a6a6a6; margin-top: 6px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 100%; }
-  #bar { width: 100%; height: 4px; background: #404040; border-radius: 2px; margin-top: 22px; }
+  #actions { display: flex; justify-content: space-between; width: 100%; margin-top: 6px; }
+  #actions button { background: none; border: 0; color: #fff; font-size: 30px; width: 64px; height: 48px; }
+  #like.on { color: #1fd662; }
+  #bar { width: 100%; height: 4px; background: #404040; border-radius: 2px; margin-top: 10px; }
   #fill { height: 4px; width: 0; background: #fff; border-radius: 2px; }
   #times { width: 100%; display: flex; justify-content: space-between; font-size: 14px; color: #999; margin-top: 6px; }
   #controls { display: flex; justify-content: space-between; align-items: center; width: 300px; margin-top: 14px; }
@@ -23,7 +26,8 @@
   #controls button:active { opacity: 0.4; }
   #volume { width: 82%; margin-top: 16px; }
   #status { font-size: 15px; color: #808080; margin-top: 12px; text-align: center; min-height: 20px; }
-  #sheet { position: fixed; left: 0; right: 0; bottom: 0; background: #1c1c1c; border-radius: 14px 14px 0 0; padding: 10px 0 24px; display: none; }
+  #sheet { position: fixed; left: 0; right: 0; bottom: 0; background: #1c1c1c; border-radius: 14px 14px 0 0; padding: 10px 0 24px; display: none; max-height: 70%; overflow-y: scroll; -webkit-overflow-scrolling: touch; }
+  #sheet h3 { margin: 6px 0 4px; text-align: center; font-size: 15px; color: #999; font-weight: 500; }
   #sheet button { display: block; width: 100%; background: none; border: 0; color: #fff; font-size: 20px; padding: 16px; }
   #sheet .cancel { color: #1fd662; font-weight: 600; }
 </style>
@@ -33,6 +37,7 @@
 <div id="art"></div>
 <div id="title">Loading…</div>
 <div id="artist"></div>
+<div id="actions"><button id="like">&#9825;</button><button id="add">+</button></div>
 <div id="bar"><div id="fill"></div></div>
 <div id="times"><span id="elapsed"></span><span id="duration"></span></div>
 <div id="controls">
@@ -50,7 +55,7 @@ var params = {};
 location.hash.replace(/^#/, '').split('&').forEach(function (kv) { var p = kv.split('='); if (p[0]) params[p[0]] = decodeURIComponent(p[1] || ''); });
 var clientId = params.cid, refreshToken = params.rt;
 var accessToken = null, tokenExpiry = 0;
-var state = { playing: false, progress: 0, duration: 0, art: null, draggingVolume: false, lastPoll: 0 };
+var state = { uri: null, liked: false, playlists: null, me: null, playing: false, progress: 0, duration: 0, art: null, draggingVolume: false, lastPoll: 0 };
 var $ = function (id) { return document.getElementById(id); };
 
 function setStatus(msg) { $('status').textContent = msg || ''; }
@@ -94,6 +99,8 @@ function render() {
   $('elapsed').textContent = state.duration ? fmt(state.progress) : '';
   $('duration').textContent = state.duration ? fmt(state.duration) : '';
   $('play').innerHTML = state.playing ? '&#10074;&#10074;' : '&#9654;';
+  $('like').innerHTML = state.liked ? '&#9829;' : '&#9825;';
+  $('like').className = state.liked ? 'on' : '';
 }
 
 function poll() {
@@ -118,11 +125,77 @@ function poll() {
     var images = (item.album && item.album.images) || [];
     var url = images.length > 1 ? images[1].url : (images[0] && images[0].url);
     if (url && url !== state.art) { state.art = url; $('art').style.backgroundImage = 'url(' + url + ')'; }
+    if (item.uri && item.uri !== state.uri) { state.uri = item.uri; checkLiked(); }
     render();
   });
 }
 
 function refreshSoon() { setTimeout(poll, 400); }
+
+// Liked songs: checked once per song change. Spotify's library endpoints take track URIs.
+function libraryPath(uri) { return 'https://api.spotify.com/v1/me/library?uris=' + encodeURIComponent(uri); }
+function api(method, url, body) {
+  return getToken().then(function (token) {
+    var opts = { method: method, headers: { Authorization: 'Bearer ' + token } };
+    if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    return fetch(url, opts);
+  }).then(function (r) {
+    return r.text().then(function (t) { var j = null; try { j = t ? JSON.parse(t) : null; } catch (e) {} return { status: r.status, json: j }; });
+  }).catch(function (e) { setStatus(e.message); return { status: 0, json: null }; });
+}
+function checkLiked() {
+  var uri = state.uri;
+  api('GET', 'https://api.spotify.com/v1/me/library/contains?uris=' + encodeURIComponent(uri)).then(function (res) {
+    if (uri === state.uri && res.status === 200 && res.json) { state.liked = !!res.json[0]; render(); }
+  });
+}
+$('like').onclick = function () {
+  if (!state.uri) return;
+  state.liked = !state.liked; render();
+  api(state.liked ? 'PUT' : 'DELETE', libraryPath(state.uri)).then(function (res) {
+    if (res.status >= 300) { setStatus('Could not update liked songs'); checkLiked(); }
+  });
+};
+
+// Playlists: loaded on the first tap of +, then kept. Spotify only allows adding to playlists you own or collaborate on.
+function loadPlaylists() {
+  if (state.playlists) return Promise.resolve(state.playlists);
+  var list = [];
+  function page(url) {
+    return api('GET', url).then(function (res) {
+      if (res.status !== 200) throw new Error('Could not load playlists');
+      res.json.items.forEach(function (p) { if (p && (p.owner.id === state.me || p.collaborative)) list.push(p); });
+      return res.json.next ? page(res.json.next) : list;
+    });
+  }
+  var me = state.me ? Promise.resolve() : api('GET', 'https://api.spotify.com/v1/me').then(function (res) { state.me = res.json && res.json.id; });
+  return me.then(function () { return page('https://api.spotify.com/v1/me/playlists?limit=50'); }).then(function (l) {
+    l.sort(function (a, b) { return a.name.localeCompare(b.name); });
+    state.playlists = l; return l;
+  });
+}
+$('add').onclick = function () {
+  if (!state.uri) return;
+  var uri = state.uri, name = $('title').textContent;
+  setStatus('Loading playlists…');
+  loadPlaylists().then(function (list) {
+    setStatus('');
+    var sheet = $('sheet'); sheet.innerHTML = '<h3>Add to playlist</h3>';
+    list.forEach(function (p) {
+      var b = document.createElement('button'); b.textContent = p.name;
+      b.onclick = function () {
+        sheet.style.display = 'none';
+        api('POST', 'https://api.spotify.com/v1/playlists/' + p.id + '/items', { uris: [uri] }).then(function (res) {
+          setStatus(res.status < 300 ? 'Added ' + name + ' to ' + p.name : 'Could not add to ' + p.name);
+        });
+      };
+      sheet.appendChild(b);
+    });
+    var c = document.createElement('button'); c.className = 'cancel'; c.textContent = 'Cancel';
+    c.onclick = function () { sheet.style.display = 'none'; };
+    sheet.appendChild(c); sheet.style.display = 'block'; sheet.scrollTop = 0;
+  }).catch(function (e) { setStatus(e.message); });
+};
 
 $('play').onclick = function () {
   state.playing = !state.playing; render();
@@ -153,7 +226,7 @@ $('device').onclick = function () {
   });
 };
 
-document.addEventListener('touchmove', function (e) { if (e.target.id !== 'volume') e.preventDefault(); }, { passive: false });
+document.addEventListener('touchmove', function (e) { if (e.target.id !== 'volume' && !$('sheet').contains(e.target)) e.preventDefault(); }, { passive: false });
 setInterval(function () {
   if (state.playing) state.progress = Math.min(state.progress + 500, state.duration);
   render();
